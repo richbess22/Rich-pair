@@ -1,3 +1,8 @@
+/* server.js
+   Sila Session Generator - pairing-only service
+   - robust import handling for @whiskeysockets/baileys
+*/
+
 import 'dotenv/config';
 import express from 'express';
 import path from 'path';
@@ -5,17 +10,52 @@ import fs from 'fs-extra';
 import pino from 'pino';
 import { Storage } from 'megajs';
 import { fileURLToPath } from 'url';
-import {
-  default as makeWASocket,
-  useMultiFileAuthState,
-  Browsers,
-  DisconnectReason,
-  delay
-} from '@whiskeysockets/baileys';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+/* ---------------------------
+   Robust import for Baileys:
+   handle different export shapes across versions and bundlers
+   --------------------------- */
+let makeWASocket;
+let useMultiFileAuthState;
+let Browsers;
+let DisconnectReason;
+let delayFn;
+
+try {
+  const baileysImport = await import('@whiskeysockets/baileys');
+
+  // attempt to resolve exports from different shapes
+  // 1) named exports (most common)
+  makeWASocket = baileysImport.makeWASocket ?? baileysImport.default?.makeWASocket ?? baileysImport.default ?? baileysImport;
+  useMultiFileAuthState = baileysImport.useMultiFileAuthState ?? baileysImport.default?.useMultiFileAuthState;
+  Browsers = baileysImport.Browsers ?? baileysImport.default?.Browsers;
+  DisconnectReason = baileysImport.DisconnectReason ?? baileysImport.default?.DisconnectReason;
+  delayFn = baileysImport.delay ?? baileysImport.default?.delay;
+
+  // If makeWASocket is an object (not function), try deeper:
+  if (typeof makeWASocket === 'object' && makeWASocket.makeWASocket) {
+    // e.g. default exported object with makeWASocket field
+    makeWASocket = makeWASocket.makeWASocket;
+  }
+
+} catch (e) {
+  console.error('Failed to import @whiskeysockets/baileys:', e);
+  throw e;
+}
+
+if (typeof makeWASocket !== 'function') {
+  throw new Error('makeWASocket is not a function after import resolution. Check installed @whiskeysockets/baileys version');
+}
+
+// alias delay
+const delay = typeof delayFn === 'function' ? delayFn : (ms) => new Promise(r => setTimeout(r, ms));
+
+/* ---------------------------
+   App setup
+   --------------------------- */
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -31,7 +71,9 @@ const writeDB = (d) => fs.writeJsonSync(DB_PATH, d, { spaces: 2 });
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-/** Upload creds.json to MEGA and return the share link */
+/* ---------------------------
+   MEGA upload function
+   --------------------------- */
 async function uploadCredsToMega(credsPath) {
   if (!process.env.MEGA_EMAIL || !process.env.MEGA_PASS) {
     throw new Error('MEGA_EMAIL and MEGA_PASS must be set in .env');
@@ -53,16 +95,16 @@ async function uploadCredsToMega(credsPath) {
   return link;
 }
 
-/** Helper to extract mega file code */
 function extractMegaFileCode(megaLink) {
   if (!megaLink) return null;
   const m = megaLink.match(/mega\.nz\/file\/([^#?\/]+)/);
   if (m) return m[1];
-  // fallback: base64 short code
   return Buffer.from(megaLink).toString('base64').slice(0, 12);
 }
 
-/** Serve UI */
+/* ---------------------------
+   Simple frontend
+   --------------------------- */
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'pair.html'));
 });
@@ -70,8 +112,8 @@ app.get('/', (req, res) => {
 /**
  * POST /pair
  * body: { number: "2557xxxxxxx" }
- * Response:
- *  - { status: 'pairing_code_sent', code } OR
+ * Responses:
+ *  - { status: 'pairing_code_sent', code }
  *  - { status: 'paired', sid: 'Sila~<CODE>', megaLink }
  */
 app.post('/pair', async (req, res) => {
@@ -91,14 +133,14 @@ app.post('/pair', async (req, res) => {
       auth: { creds: state.creds, keys: state.keys },
       printQRInTerminal: false,
       logger,
-      browser: Browsers.macOS('Safari'),
+      browser: (Browsers && Browsers.macOS) ? Browsers.macOS('Safari') : ['SilaSessionGenerator','Chrome','1.0'],
       markOnlineOnConnect: false,
       syncFullHistory: false,
       defaultQueryTimeoutMs: 60000
     });
 
     sock.ev.on('creds.update', async () => {
-      try { await saveCreds(); } catch (e) { logger.error(e, 'saveCreds'); }
+      try { await saveCreds(); } catch (e) { logger.error({ e }, 'saveCreds failed'); }
     });
 
     let responded = false;
@@ -107,7 +149,6 @@ app.post('/pair', async (req, res) => {
       try {
         const { connection } = update;
         logger.info({ connection, number: sanitized }, 'connection.update');
-
         if (connection === 'open') {
           const credsFile = path.join(sessionPath, 'creds.json');
           if (!fs.existsSync(credsFile)) {
@@ -126,9 +167,9 @@ app.post('/pair', async (req, res) => {
             db.sessions.push({ sid, number: sanitized, megaLink, createdAt: new Date().toISOString() });
             writeDB(db);
 
-            // try to notify the account's jid (best-effort)
+            // best-effort notify the connected account (if possible)
             try {
-              const myJid = sock.user?.id ? sock.user.id : null;
+              const myJid = sock.user?.id ?? null;
               if (myJid) await sock.sendMessage(myJid, { text: `Paired ${sanitized}\nSession ID: ${sid}` });
             } catch (notifyErr) {
               logger.warn({ notifyErr }, 'notify owner failed');
@@ -144,7 +185,7 @@ app.post('/pair', async (req, res) => {
           }
         } else if (connection === 'close') {
           const code = update.lastDisconnect?.error?.output?.statusCode;
-          if (!responded && code === DisconnectReason.loggedOut) {
+          if (!responded && code === DisconnectReason?.loggedOut) {
             responded = true;
             res.status(500).json({ error: 'logged_out' });
           }
@@ -195,9 +236,17 @@ app.post('/pair', async (req, res) => {
   }
 });
 
-/** List stored Sila~ sessions (non-sensitive) */
+/* list stored sessions (non-sensitive) */
 app.get('/sessions', (req, res) => {
-  try { const db = readDB(); res.json(db.sessions || []); } catch (e) { res.status(500).json({ error: 'failed_to_read_db' }); }
+  try {
+    const db = readDB();
+    res.json(db.sessions || []);
+  } catch (e) {
+    res.status(500).json({ error: 'failed_to_read_db' });
+  }
 });
+
+/* basic health */
+app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 app.listen(PORT, () => logger.info(`Sila Session Generator running on http://localhost:${PORT}`));
