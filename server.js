@@ -1,19 +1,20 @@
-require('dotenv').config();
-
-const express = require('express');
-const path = require('path');
-const fs = require('fs-extra');
-const pino = require('pino');
-const { Storage } = require('megajs');
-const os = require('os');
-
-const {
-  default: makeWASocket,
+import 'dotenv/config';
+import express from 'express';
+import path from 'path';
+import fs from 'fs-extra';
+import pino from 'pino';
+import { Storage } from 'megajs';
+import { fileURLToPath } from 'url';
+import {
+  default as makeWASocket,
   useMultiFileAuthState,
   Browsers,
   DisconnectReason,
   delay
-} = require('@whiskeysockets/baileys');
+} from '@whiskeysockets/baileys';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
@@ -25,8 +26,8 @@ fs.ensureDirSync(SESSION_BASE_PATH);
 
 const DB_PATH = path.join(__dirname, 'db.json');
 if (!fs.existsSync(DB_PATH)) fs.writeJsonSync(DB_PATH, { sessions: [] }, { spaces: 2 });
-function readDB() { return fs.readJsonSync(DB_PATH); }
-function writeDB(d) { fs.writeJsonSync(DB_PATH, d, { spaces: 2 }); }
+const readDB = () => fs.readJsonSync(DB_PATH);
+const writeDB = (d) => fs.writeJsonSync(DB_PATH, d, { spaces: 2 });
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
@@ -46,14 +47,22 @@ async function uploadCredsToMega(credsPath) {
   const size = fs.statSync(credsPath).size;
   const name = `Sila-${Date.now()}.json`;
 
-  // upload returns an object with nodeId
   const upload = await storage.upload({ name, size }, fs.createReadStream(credsPath)).complete;
   const node = storage.files[upload.nodeId];
   const link = await node.link(); // e.g. https://mega.nz/file/<CODE>#<KEY>
   return link;
 }
 
-/** Serve simple UI */
+/** Helper to extract mega file code */
+function extractMegaFileCode(megaLink) {
+  if (!megaLink) return null;
+  const m = megaLink.match(/mega\.nz\/file\/([^#?\/]+)/);
+  if (m) return m[1];
+  // fallback: base64 short code
+  return Buffer.from(megaLink).toString('base64').slice(0, 12);
+}
+
+/** Serve UI */
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'pair.html'));
 });
@@ -62,7 +71,7 @@ app.get('/', (req, res) => {
  * POST /pair
  * body: { number: "2557xxxxxxx" }
  * Response:
- *  - { status: 'pairing_code_sent', code }   OR
+ *  - { status: 'pairing_code_sent', code } OR
  *  - { status: 'paired', sid: 'Sila~<CODE>', megaLink }
  */
 app.post('/pair', async (req, res) => {
@@ -71,7 +80,7 @@ app.post('/pair', async (req, res) => {
     if (!number) return res.status(400).json({ error: 'number required' });
 
     const sanitized = ('' + number).replace(/\D/g, '');
-    if (sanitized.length < 8) return res.status(400).json({ error: 'invalid number' });
+    if (sanitized.length < 7) return res.status(400).json({ error: 'invalid number' });
 
     const sessionPath = path.join(SESSION_BASE_PATH, `sila_${sanitized}`);
     await fs.ensureDir(sessionPath);
@@ -89,19 +98,17 @@ app.post('/pair', async (req, res) => {
     });
 
     sock.ev.on('creds.update', async () => {
-      try { await saveCreds(); } catch (e) { logger.error('saveCreds error', e); }
+      try { await saveCreds(); } catch (e) { logger.error(e, 'saveCreds'); }
     });
 
     let responded = false;
 
-    // connection update: when open -> upload creds -> return Sila~id
     sock.ev.on('connection.update', async (update) => {
       try {
-        const { connection, lastDisconnect } = update;
+        const { connection } = update;
         logger.info({ connection, number: sanitized }, 'connection.update');
 
         if (connection === 'open') {
-          // ensure creds exist
           const credsFile = path.join(sessionPath, 'creds.json');
           if (!fs.existsSync(credsFile)) {
             logger.error('creds.json not found after open');
@@ -111,36 +118,32 @@ app.post('/pair', async (req, res) => {
 
           try {
             const megaLink = await uploadCredsToMega(credsFile);
-            // try to extract code after /file/
-            const m = megaLink.match(/mega\\.nz\\/file\\/(.*?)(?:#|$)/);
-            const code = m ? m[1] : Buffer.from(megaLink).toString('base64').slice(0, 12);
+            const code = extractMegaFileCode(megaLink);
             const sid = `Sila~${code}`;
 
-            // persist to db
             const db = readDB();
             db.sessions = db.sessions || [];
             db.sessions.push({ sid, number: sanitized, megaLink, createdAt: new Date().toISOString() });
             writeDB(db);
 
-            // respond via HTTP if still waiting
+            // try to notify the account's jid (best-effort)
+            try {
+              const myJid = sock.user?.id ? sock.user.id : null;
+              if (myJid) await sock.sendMessage(myJid, { text: `Paired ${sanitized}\nSession ID: ${sid}` });
+            } catch (notifyErr) {
+              logger.warn({ notifyErr }, 'notify owner failed');
+            }
+
             if (!responded) {
               responded = true;
               res.json({ status: 'paired', sid, megaLink });
-            }
-
-            // optionally notify the account itself (owner) - best-effort
-            try {
-              const myJid = await sock.decodeJid(sock.user.id);
-              await sock.sendMessage(myJid, { text: `Pairing complete for ${sanitized}\nSession ID: ${sid}` });
-            } catch (notifyErr) {
-              logger.warn({ notifyErr }, 'failed to notify owner jid');
             }
           } catch (uploadErr) {
             logger.error({ uploadErr }, 'upload to MEGA failed');
             if (!responded) { responded = true; res.status(500).json({ error: 'upload_failed', details: String(uploadErr) }); }
           }
         } else if (connection === 'close') {
-          const code = lastDisconnect?.error?.output?.statusCode;
+          const code = update.lastDisconnect?.error?.output?.statusCode;
           if (!responded && code === DisconnectReason.loggedOut) {
             responded = true;
             res.status(500).json({ error: 'logged_out' });
@@ -151,7 +154,7 @@ app.post('/pair', async (req, res) => {
       }
     });
 
-    // if not registered, request pairing code and return it immediately
+    // request pairing code if not registered
     if (!sock.authState.creds.registered) {
       let pairingCode = null;
       let tries = 3;
@@ -162,12 +165,12 @@ app.post('/pair', async (req, res) => {
           if (pairingCode) {
             if (!responded) {
               responded = true;
-              return res.json({ status: 'pairing_code_sent', code: pairingCode, message: 'Open WhatsApp â†’ Linked Devices â†’ Link a device, then enter code.' });
+              return res.json({ status: 'pairing_code_sent', code: pairingCode, message: 'Open WhatsApp → Linked Devices → Link a device, then enter code.' });
             }
           }
         } catch (err) {
           tries--;
-          logger.warn({ err, tries }, 'requestPairingCode failed, retrying');
+          logger.warn({ err, tries }, 'requestPairingCode failed');
           if (tries <= 0 && !responded) {
             responded = true;
             return res.status(500).json({ error: 'failed_to_generate_pairing_code' });
@@ -175,18 +178,14 @@ app.post('/pair', async (req, res) => {
         }
       }
     } else {
-      // already registered - the socket will open and upload creds; respond that it's already registered
-      if (!responded) {
-        responded = true;
-        res.json({ status: 'already_registered', message: 'This number appears already registered. Waiting for connection open.' });
-      }
+      if (!responded) { responded = true; res.json({ status: 'already_registered', message: 'This number appears registered. Waiting for connection open.' }); }
     }
 
-    // safety timeout: if nothing returns within 30s, inform client that pairing is pending
+    // safety timeout
     setTimeout(() => {
       if (!responded) {
         responded = true;
-        try { res.status(202).json({ status: 'waiting', message: 'Waiting for pairing to complete. If you already entered the code in WhatsApp, retry the request after a few seconds.' }); } catch (e) {}
+        try { res.status(202).json({ status: 'waiting', message: 'Waiting for pairing to complete.' }); } catch (e) {}
       }
     }, 30000);
 
@@ -196,15 +195,9 @@ app.post('/pair', async (req, res) => {
   }
 });
 
-/** List stored Sila~ sessions (non-sensitive: returns stored MEGA link & sid) */
+/** List stored Sila~ sessions (non-sensitive) */
 app.get('/sessions', (req, res) => {
-  try {
-    const db = readDB();
-    res.json(db.sessions || []);
-  } catch (e) {
-    res.status(500).json({ error: 'failed_to_read_db' });
-  }
+  try { const db = readDB(); res.json(db.sessions || []); } catch (e) { res.status(500).json({ error: 'failed_to_read_db' }); }
 });
 
 app.listen(PORT, () => logger.info(`Sila Session Generator running on http://localhost:${PORT}`));
-
