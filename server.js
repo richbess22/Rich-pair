@@ -1,252 +1,123 @@
-/* server.js
-   Sila Session Generator - pairing-only service
-   - robust import handling for @whiskeysockets/baileys
-*/
+/**
+ * server.js
+ * WhatsApp Multi-Device bot using Baileys
+ * Includes enhanced connection handling and error logging
+ */
 
-import 'dotenv/config';
 import express from 'express';
+import { Boom } from '@hapi/boom';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeysockets/baileys';
+import fs from 'fs';
 import path from 'path';
-import fs from 'fs-extra';
-import pino from 'pino';
-import { Storage } from 'megajs';
-import { fileURLToPath } from 'url';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-/* ---------------------------
-   Robust import for Baileys:
-   handle different export shapes across versions and bundlers
-   --------------------------- */
-let makeWASocket;
-let useMultiFileAuthState;
-let Browsers;
-let DisconnectReason;
-let delayFn;
-
-try {
-  const baileysImport = await import('@whiskeysockets/baileys');
-
-  // attempt to resolve exports from different shapes
-  // 1) named exports (most common)
-  makeWASocket = baileysImport.makeWASocket ?? baileysImport.default?.makeWASocket ?? baileysImport.default ?? baileysImport;
-  useMultiFileAuthState = baileysImport.useMultiFileAuthState ?? baileysImport.default?.useMultiFileAuthState;
-  Browsers = baileysImport.Browsers ?? baileysImport.default?.Browsers;
-  DisconnectReason = baileysImport.DisconnectReason ?? baileysImport.default?.DisconnectReason;
-  delayFn = baileysImport.delay ?? baileysImport.default?.delay;
-
-  // If makeWASocket is an object (not function), try deeper:
-  if (typeof makeWASocket === 'object' && makeWASocket.makeWASocket) {
-    // e.g. default exported object with makeWASocket field
-    makeWASocket = makeWASocket.makeWASocket;
-  }
-
-} catch (e) {
-  console.error('Failed to import @whiskeysockets/baileys:', e);
-  throw e;
-}
-
-if (typeof makeWASocket !== 'function') {
-  throw new Error('makeWASocket is not a function after import resolution. Check installed @whiskeysockets/baileys version');
-}
-
-// alias delay
-const delay = typeof delayFn === 'function' ? delayFn : (ms) => new Promise(r => setTimeout(r, ms));
-
-/* ---------------------------
-   App setup
-   --------------------------- */
 const app = express();
 app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
-const PORT = process.env.PORT || 3000;
-const SESSION_BASE_PATH = process.env.SESSION_BASE_PATH || path.join(__dirname, 'sessions');
-fs.ensureDirSync(SESSION_BASE_PATH);
+const SESSIONS_DIR = path.join('./sessions');
 
-const DB_PATH = path.join(__dirname, 'db.json');
-if (!fs.existsSync(DB_PATH)) fs.writeJsonSync(DB_PATH, { sessions: [] }, { spaces: 2 });
-const readDB = () => fs.readJsonSync(DB_PATH);
-const writeDB = (d) => fs.writeJsonSync(DB_PATH, d, { spaces: 2 });
+// Utility: ensure session dir exists
+if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR);
 
-const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
-
-/* ---------------------------
-   MEGA upload function
-   --------------------------- */
-async function uploadCredsToMega(credsPath) {
-  if (!process.env.MEGA_EMAIL || !process.env.MEGA_PASS) {
-    throw new Error('MEGA_EMAIL and MEGA_PASS must be set in .env');
+// Utility: clean session folder
+function clearSession(number) {
+  const folder = path.join(SESSIONS_DIR, `sila_${number}`);
+  if (fs.existsSync(folder)) {
+    fs.rmSync(folder, { recursive: true, force: true });
+    console.log(`[INFO] Cleared session for ${number}`);
   }
+}
 
-  const storage = new Storage({
-    email: process.env.MEGA_EMAIL,
-    password: process.env.MEGA_PASS
+// Route: Pair number
+app.post('/pair', async (req, res) => {
+  const { number } = req.body;
+  if (!number || typeof number !== 'string') return res.status(400).json({ error: 'missing_number' });
+
+  const sanitized = number.replace(/\D/g, ''); // remove any non-digit
+  const sessionFolder = path.join(SESSIONS_DIR, `sila_${sanitized}`);
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
+
+  const sock = makeWASocket({
+    auth: state,
+    printQRInTerminal: true, // optional
+    logger: console,
   });
 
-  await storage.ready;
+  let responded = false;
 
-  const size = fs.statSync(credsPath).size;
-  const name = `Sila-${Date.now()}.json`;
+  // Connection update handler
+  sock.ev.on('connection.update', async (update) => {
+    try {
+      const { connection, lastDisconnect } = update;
+      console.log(`[INFO] Connection update for ${sanitized}:`, connection);
 
-  const upload = await storage.upload({ name, size }, fs.createReadStream(credsPath)).complete;
-  const node = storage.files[upload.nodeId];
-  const link = await node.link(); // e.g. https://mega.nz/file/<CODE>#<KEY>
-  return link;
-}
+      if (connection === 'open') {
+        console.log(`[INFO] Connected successfully: ${sanitized}`);
+        await saveCreds();
+        if (!responded) {
+          responded = true;
+          res.json({ status: 'connected', number: sanitized });
+        }
+        return;
+      }
 
-function extractMegaFileCode(megaLink) {
-  if (!megaLink) return null;
-  const m = megaLink.match(/mega\.nz\/file\/([^#?\/]+)/);
-  if (m) return m[1];
-  return Buffer.from(megaLink).toString('base64').slice(0, 12);
-}
+      if (connection === 'connecting') return;
 
-/* ---------------------------
-   Simple frontend
-   --------------------------- */
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'pair.html'));
-});
+      if (connection === 'close') {
+        console.error(`[ERROR] Connection closed for ${sanitized}:`, lastDisconnect);
 
-/**
- * POST /pair
- * body: { number: "2557xxxxxxx" }
- * Responses:
- *  - { status: 'pairing_code_sent', code }
- *  - { status: 'paired', sid: 'Sila~<CODE>', megaLink }
- */
-app.post('/pair', async (req, res) => {
-  try {
-    const { number } = req.body;
-    if (!number) return res.status(400).json({ error: 'number required' });
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errMsg = lastDisconnect?.error?.message || lastDisconnect?.error?.output || String(lastDisconnect);
 
-    const sanitized = ('' + number).replace(/\D/g, '');
-    if (sanitized.length < 7) return res.status(400).json({ error: 'invalid number' });
-
-    const sessionPath = path.join(SESSION_BASE_PATH, `sila_${sanitized}`);
-    await fs.ensureDir(sessionPath);
-
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-
-    const sock = makeWASocket({
-      auth: { creds: state.creds, keys: state.keys },
-      printQRInTerminal: false,
-      logger,
-      browser: (Browsers && Browsers.macOS) ? Browsers.macOS('Safari') : ['SilaSessionGenerator','Chrome','1.0'],
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-      defaultQueryTimeoutMs: 60000
-    });
-
-    sock.ev.on('creds.update', async () => {
-      try { await saveCreds(); } catch (e) { logger.error({ e }, 'saveCreds failed'); }
-    });
-
-    let responded = false;
-
-    sock.ev.on('connection.update', async (update) => {
-      try {
-        const { connection } = update;
-        logger.info({ connection, number: sanitized }, 'connection.update');
-        if (connection === 'open') {
-          const credsFile = path.join(sessionPath, 'creds.json');
-          if (!fs.existsSync(credsFile)) {
-            logger.error('creds.json not found after open');
-            if (!responded) { responded = true; res.status(500).json({ error: 'creds_not_found' }); }
-            return;
-          }
-
-          try {
-            const megaLink = await uploadCredsToMega(credsFile);
-            const code = extractMegaFileCode(megaLink);
-            const sid = `Sila~${code}`;
-
-            const db = readDB();
-            db.sessions = db.sessions || [];
-            db.sessions.push({ sid, number: sanitized, megaLink, createdAt: new Date().toISOString() });
-            writeDB(db);
-
-            // best-effort notify the connected account (if possible)
-            try {
-              const myJid = sock.user?.id ?? null;
-              if (myJid) await sock.sendMessage(myJid, { text: `Paired ${sanitized}\nSession ID: ${sid}` });
-            } catch (notifyErr) {
-              logger.warn({ notifyErr }, 'notify owner failed');
-            }
-
-            if (!responded) {
-              responded = true;
-              res.json({ status: 'paired', sid, megaLink });
-            }
-          } catch (uploadErr) {
-            logger.error({ uploadErr }, 'upload to MEGA failed');
-            if (!responded) { responded = true; res.status(500).json({ error: 'upload_failed', details: String(uploadErr) }); }
-          }
-        } else if (connection === 'close') {
-          const code = update.lastDisconnect?.error?.output?.statusCode;
-          if (!responded && code === DisconnectReason?.loggedOut) {
+        if (errMsg && /phone|number|invalid/i.test(errMsg)) {
+          if (!responded) {
             responded = true;
-            res.status(500).json({ error: 'logged_out' });
+            res.status(400).json({
+              error: 'invalid_number_or_not_registered',
+              details: 'Check phone number is correct and registered on WhatsApp.',
+            });
+          }
+        } else if (statusCode === DisconnectReason.loggedOut) {
+          if (!responded) {
+            responded = true;
+            res.status(400).json({
+              error: 'logged_out',
+              details: 'The account appears logged out. Try removing local session and re-pair.',
+            });
+          }
+        } else {
+          if (!responded) {
+            responded = true;
+            res.status(500).json({
+              error: 'connection_failed',
+              details: errMsg || 'Connection failed for unknown reason. See logs.',
+            });
           }
         }
-      } catch (e) {
-        logger.error({ e }, 'connection.update handler error');
-      }
-    });
 
-    // request pairing code if not registered
-    if (!sock.authState.creds.registered) {
-      let pairingCode = null;
-      let tries = 3;
-      while (tries > 0 && !pairingCode) {
-        try {
-          await delay(1000);
-          pairingCode = await sock.requestPairingCode(sanitized);
-          if (pairingCode) {
-            if (!responded) {
-              responded = true;
-              return res.json({ status: 'pairing_code_sent', code: pairingCode, message: 'Open WhatsApp → Linked Devices → Link a device, then enter code.' });
-            }
-          }
-        } catch (err) {
-          tries--;
-          logger.warn({ err, tries }, 'requestPairingCode failed');
-          if (tries <= 0 && !responded) {
-            responded = true;
-            return res.status(500).json({ error: 'failed_to_generate_pairing_code' });
-          }
-        }
+        try { sock.ws?.close(); } catch (e) {}
+        return;
       }
-    } else {
-      if (!responded) { responded = true; res.json({ status: 'already_registered', message: 'This number appears registered. Waiting for connection open.' }); }
-    }
-
-    // safety timeout
-    setTimeout(() => {
+    } catch (e) {
+      console.error(`[ERROR] connection.update handler error:`, e);
       if (!responded) {
         responded = true;
-        try { res.status(202).json({ status: 'waiting', message: 'Waiting for pairing to complete.' }); } catch (e) {}
+        try { res.status(500).json({ error: 'internal_error', details: String(e) }); } catch (e2) {}
       }
-    }, 30000);
+    }
+  });
 
-  } catch (err) {
-    logger.error({ err }, 'pair endpoint error');
-    try { res.status(500).json({ error: String(err) }); } catch (e) {}
-  }
+  // Credential update
+  sock.ev.on('creds.update', saveCreds);
 });
 
-/* list stored sessions (non-sensitive) */
-app.get('/sessions', (req, res) => {
-  try {
-    const db = readDB();
-    res.json(db.sessions || []);
-  } catch (e) {
-    res.status(500).json({ error: 'failed_to_read_db' });
-  }
+// Route: Clear session
+app.post('/clear-session', (req, res) => {
+  const { number } = req.body;
+  if (!number) return res.status(400).json({ error: 'missing_number' });
+  clearSession(number);
+  res.json({ status: 'cleared', number });
 });
 
-/* basic health */
-app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
-
-app.listen(PORT, () => logger.info(`Sila Session Generator running on http://localhost:${PORT}`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`[INFO] Server running on port ${PORT}`));
