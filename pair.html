@@ -1,0 +1,53 @@
+(save alongside server.js)
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Sila â€” Pairing</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial;background:#f6f8fb;padding:24px}
+    .card{max-width:720px;margin:28px auto;background:#fff;padding:18px;border-radius:10px;box-shadow:0 8px 30px rgba(12,20,40,.06)}
+    input,button{padding:10px;border-radius:8px;border:1px solid #e6edf3;width:100%;box-sizing:border-box}
+    button{cursor:pointer}
+    pre{background:#0b1220;color:#fff;padding:12px;border-radius:8px;overflow:auto}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Sila Session Generator</h2>
+    <p>Enter phone number (international, no plus). Click <b>Generate Pairing Code</b>, then in WhatsApp go to <i>Linked Devices â†’ Link a device</i> and enter the code.</p>
+
+    <form id="form">
+      <label>Phone number</label><br/>
+      <input id="number" placeholder="eg. 2557xxxxxxxx" /><br/><br/>
+      <button type="submit">Generate Pairing Code</button>
+    </form>
+
+    <hr/>
+    <div id="out"></div>
+  </div>
+
+  <script>
+    const out = document.getElementById('out');
+    const form = document.getElementById('form');
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      out.innerHTML = 'Requesting pairing code...';
+      const number = document.getElementById('number').value.trim();
+      try {
+        const r = await fetch('/pair', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ number })
+        });
+        const j = await r.json();
+        out.innerHTML = '<pre>' + JSON.stringify(j, null, 2) + '</pre>';
+      } catch (err) {
+        out.innerHTML = 'Error: ' + err.message;
+      }
+    });
+  </script>
+</body>
+</html>
